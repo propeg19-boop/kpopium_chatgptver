@@ -1,325 +1,421 @@
-// player.js — the playback engine. Station-agnostic: call Player.initForStation()
-// to point it at a different station's playlist. Every track change goes through
-// playVideoId() — nothing here ever asks YouTube's own playlist cursor "what's next";
-// that's what caused the title/audio mismatch bug earlier in this build.
+// Playback engine — station-agnostic. Every bit of queue/shuffle/repeat/
+// manual-navigation logic here is unchanged from the single-station build;
+// the only addition is initForStation() to swap playlists, and the tape
+// -insert hook on manually-picked tracks.
 
-const Player = (() => {
-  const SFX_TAPE = "assets/sfx/tape-insert.mp3";
-  const MANUAL_LOAD_DELAY = 400; // ms — room for the tape-insert clunk to play
-  const PLAYLIST_POLL_MS = 300;
-  const PLAYLIST_POLL_MAX_ATTEMPTS = 10;
+const FALLBACK_COLORS = ["#b985ff,#241238", "#ff5ec4,#3a0f3a", "#5c7bff,#1a1a4a", "#4cc9ff,#0f2a3a"];
+const TAPE_INSERT_DELAY_MS = 400; // tune this to match the real clip's length
 
-  let yt = null;
-  let ytApiReady = false;
-  let pendingInitStation = null;
+const playerState = {
+  player: null,
+  ytReady: false,
+  activeStationId: null,
+  playlistIds: [],
+  playlistIndex: 0,
+  library: {},
+  queue: [],
+  queuePointer: -1,
+  currentVideoId: null,
+  shuffle: false,
+  repeatMode: "off",
+  tickHandle: null,
+  draggedIndex: null,
+};
 
-  let station = null;
-  let library = [];            // [{videoId, title, channel, thumb}], playlist order
-  let queue = [];              // [{videoId}], persists until explicit Clear
-  let queuePointer = -1;       // index into `queue` currently playing, -1 = not on a queue item
-  let currentVideoId = null;
-  let currentSourceIndex = -1; // index into `library` for the currently playing video
-  let shuffleOn = false;
-  let shuffleHistory = [];     // stack of library indices, so "back" can undo shuffle jumps
-  let repeatMode = "off";      // "off" | "all" | "one"
-  let isPlaying = false;
+const pEls = {
+  playlist: document.getElementById("playlist-list"),
+  trackCount: document.getElementById("track-count"),
+  queueBody: document.getElementById("queue-body"),
+  queueCount: document.getElementById("queue-count"),
+  playerTitle: document.getElementById("player-title"),
+  playerArtist: document.getElementById("player-artist"),
+  barFill: document.getElementById("player-bar-fill"),
+  elapsed: document.getElementById("player-elapsed"),
+  total: document.getElementById("player-total"),
+  btnPlay: document.getElementById("btn-play"),
+  btnPrev: document.getElementById("btn-prev"),
+  btnNext: document.getElementById("btn-next"),
+  btnShuffle: document.getElementById("btn-shuffle"),
+  btnRepeat: document.getElementById("btn-repeat"),
+  sfxTape: document.getElementById("sfx-tape"),
+};
 
-  let listeners = [];
-  let progressListeners = [];
-  let progressTimerId = null;
-  let tapeAudio = null;
+function formatSeconds(total) {
+  if (!isFinite(total) || total < 0) return "0:00";
+  const m = Math.floor(total / 60);
+  const s = Math.floor(total % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
 
-  // ---- YouTube API bootstrapping -----------------------------------------
-  // This MUST be assigned before the youtube iframe_api <script> in index.html
-  // finishes loading — YouTube calls it the instant the API is ready, whether
-  // or not a station has been chosen yet. Previously this was only registered
-  // after navigating into a station, so the callback could fire into a void
-  // and the player would never construct — that was the "no playlist" bug.
-  window.onYouTubeIframeAPIReady = function () {
-    ytApiReady = true;
-    if (pendingInitStation) {
-      const s = pendingInitStation;
-      pendingInitStation = null;
-      constructPlayer(s);
-    }
-  };
+// ---------- icons ----------
 
-  function constructPlayer(newStation) {
-    yt = new YT.Player("yt-player-host", {
-      height: "270",
-      width: "480",
-      playerVars: { listType: "playlist", list: newStation.playlistId, playsinline: 1 },
-      events: {
-        onReady: () => schedulePlaylistIntrospection(),
-        onStateChange: onPlayerStateChange,
-      },
-    });
+const ICON_PLAY = `<svg viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3" fill="currentColor"/></svg>`;
+const ICON_PAUSE = `<svg viewBox="0 0 24 24"><rect x="5" y="3" width="5" height="18" rx="1.5" fill="currentColor"/><rect x="14" y="3" width="5" height="18" rx="1.5" fill="currentColor"/></svg>`;
+const ICON_REPEAT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>`;
+const ICON_REPEAT_ONE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><text x="12" y="16" font-size="8" font-family="sans-serif" text-anchor="middle" fill="currentColor" stroke="none">1</text></svg>`;
+
+// ---------- metadata (oEmbed, no API key) ----------
+
+async function fetchMeta(videoId) {
+  if (playerState.library[videoId]) return playerState.library[videoId];
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    if (!res.ok) throw new Error("oEmbed failed");
+    const data = await res.json();
+    playerState.library[videoId] = { title: data.title, artist: data.author_name, thumbnail: data.thumbnail_url };
+  } catch {
+    playerState.library[videoId] = { title: "Unknown track", artist: "Unknown artist", thumbnail: null };
+  }
+  return playerState.library[videoId];
+}
+
+function coverStyle(videoId, fallbackIndex) {
+  const meta = playerState.library[videoId];
+  if (meta && meta.thumbnail) return `background-image:url('${meta.thumbnail}')`;
+  const color = FALLBACK_COLORS[fallbackIndex % FALLBACK_COLORS.length];
+  return `background: linear-gradient(135deg, ${color.split(",")[0]}, ${color.split(",")[1]})`;
+}
+
+// ---------- YouTube IFrame API ----------
+
+// Registered at script-load time (not lazily inside initForStation) so we
+// never race YouTube's async bootstrap script calling this before it exists.
+let pendingStationPlaylistId = null;
+
+window.onYouTubeIframeAPIReady = function () {
+  playerState.ytReady = true;
+  if (pendingStationPlaylistId) createPlayer(pendingStationPlaylistId);
+};
+
+// Called by app.js whenever a station is opened. If a different station is
+// already loaded we tear its YT player down and rebuild fresh; if it's the
+// same station we don't touch anything (music keeps playing).
+function initForStation(station) {
+  if (playerState.activeStationId === station.id) return;
+
+  playerState.activeStationId = station.id;
+  playerState.playlistIds = [];
+  playerState.playlistIndex = 0;
+  playerState.queue = [];
+  playerState.queuePointer = -1;
+  playerState.currentVideoId = null;
+  clearInterval(playerState.tickHandle);
+
+  if (playerState.player && playerState.player.destroy) {
+    playerState.player.destroy();
+    playerState.player = null;
   }
 
-  function schedulePlaylistIntrospection(attempt = 0) {
-    if (!yt || typeof yt.getPlaylist !== "function") return;
-    const ids = yt.getPlaylist();
-    if ((!ids || !ids.length) && attempt < PLAYLIST_POLL_MAX_ATTEMPTS) {
-      window.setTimeout(() => schedulePlaylistIntrospection(attempt + 1), PLAYLIST_POLL_MS);
-      return;
-    }
-    buildLibraryFromIds(ids || []);
+  pendingStationPlaylistId = station.playlistId;
+  if (playerState.ytReady) createPlayer(station.playlistId);
+}
+
+function createPlayer(playlistId) {
+  playerState.player = new YT.Player("yt-player", {
+    height: "200",
+    width: "200",
+    playerVars: { listType: "playlist", list: playlistId, playsinline: 1 },
+    events: { onReady, onStateChange },
+  });
+}
+
+async function onReady() {
+  playerState.playlistIds = playerState.player.getPlaylist() || [];
+  playerState.playlistIndex = playerState.player.getPlaylistIndex() || 0;
+  playerState.currentVideoId = playerState.playlistIds[playerState.playlistIndex];
+
+  await Promise.all(playerState.playlistIds.map(fetchMeta));
+  renderPlaylist();
+  updateNowPlayingCard();
+}
+
+function onStateChange(e) {
+  if (e.data === YT.PlayerState.PLAYING) {
+    pEls.btnPlay.innerHTML = ICON_PAUSE;
+    pEls.btnPlay.setAttribute("aria-label", "Pause");
+    playerState.tickHandle = setInterval(tick, 500);
+  } else {
+    pEls.btnPlay.innerHTML = ICON_PLAY;
+    pEls.btnPlay.setAttribute("aria-label", "Play");
+    clearInterval(playerState.tickHandle);
   }
 
-  async function buildLibraryFromIds(ids) {
-    library = ids.map((id) => ({ videoId: id, title: "Loading…", channel: "", thumb: "" }));
-    notify();
-    for (let i = 0; i < ids.length; i++) {
-      try {
-        const url = "https://www.youtube.com/oembed?url=" +
-          encodeURIComponent("https://www.youtube.com/watch?v=" + ids[i]) + "&format=json";
-        const res = await fetch(url);
-        if (res.ok) {
-          const meta = await res.json();
-          library[i] = {
-            videoId: ids[i],
-            title: meta.title || ids[i],
-            channel: meta.author_name || "",
-            thumb: meta.thumbnail_url || "",
-          };
-          notify();
-        }
-      } catch (e) {
-        // Metadata is best-effort — the row just keeps showing the raw video ID.
-      }
-    }
-  }
+  if (e.data === YT.PlayerState.ENDED) handleTrackEnded();
+}
 
-  function onPlayerStateChange(e) {
-    if (e.data === YT.PlayerState.PLAYING) {
-      isPlaying = true;
-      startProgressTimer();
-      notify();
-    } else if (e.data === YT.PlayerState.PAUSED) {
-      isPlaying = false;
-      stopProgressTimer();
-      notify();
-    } else if (e.data === YT.PlayerState.ENDED) {
-      stopProgressTimer();
-      onTrackEnd();
-    }
-  }
+function tick() {
+  const current = playerState.player.getCurrentTime();
+  const total = playerState.player.getDuration();
+  pEls.barFill.style.width = total ? `${(current / total) * 100}%` : "0%";
+  pEls.elapsed.textContent = formatSeconds(current);
+  pEls.total.textContent = formatSeconds(total);
+}
 
-  function onTrackEnd() {
-    if (repeatMode === "one") {
-      playVideoId(currentVideoId, { manual: false, queuePointerValue: queuePointer });
-      return;
-    }
-    step(1, false);
-  }
+// ---------- playback control ----------
 
-  // ---- station switching ---------------------------------------------------
+async function playVideoId(videoId, { manual = false } = {}) {
+  await fetchMeta(videoId);
+  playerState.currentVideoId = videoId;
+  updateNowPlayingCard();
 
-  function initForStation(newStation) {
-    station = newStation;
-    library = [];
-    queue = [];
-    queuePointer = -1;
-    currentVideoId = null;
-    currentSourceIndex = -1;
-    isPlaying = false;
-    shuffleOn = false;
-    shuffleHistory = [];
-    repeatMode = "off";
-    notify();
-
-    if (!newStation.playlistId) return; // locked / not-yet-configured station
-
-    if (!yt) {
-      if (ytApiReady) constructPlayer(newStation);
-      else pendingInitStation = newStation;
-    } else {
-      yt.loadPlaylist({ list: newStation.playlistId });
-      schedulePlaylistIntrospection();
-    }
-  }
-
-  // ---- core playback ---------------------------------------------------
-
-  function playVideoId(videoId, { manual, queuePointerValue }) {
-    currentVideoId = videoId;
-    currentSourceIndex = library.findIndex((t) => t.videoId === videoId);
-    if (typeof queuePointerValue === "number") queuePointer = queuePointerValue;
-
-    const load = () => {
-      if (yt && typeof yt.loadVideoById === "function") yt.loadVideoById(videoId);
-      isPlaying = true;
-      notify();
-    };
-
-    if (manual) {
-      playTapeSfx();
-      window.setTimeout(load, MANUAL_LOAD_DELAY);
-    } else {
-      load();
-    }
-    notify(); // reflect the queue/playlist highlight change immediately, even before load()
-  }
-
-  function step(direction, manual) {
-    if (queue.length > 0) {
-      let idx = queuePointer;
-      if (idx === -1) idx = direction > 0 ? -1 : 0;
-      let newIdx = idx + direction;
-      if (newIdx < 0 || newIdx >= queue.length) {
-        if (!manual && repeatMode === "off") { isPlaying = false; notify(); return; }
-        newIdx = ((newIdx % queue.length) + queue.length) % queue.length;
-      }
-      playVideoId(queue[newIdx].videoId, { manual, queuePointerValue: newIdx });
-      return;
-    }
-
-    if (!library.length) return;
-    let newIdx;
-    if (shuffleOn && direction > 0) {
-      if (library.length > 1) {
-        do { newIdx = Math.floor(Math.random() * library.length); } while (newIdx === currentSourceIndex);
-      } else {
-        newIdx = 0;
-      }
-      shuffleHistory.push(currentSourceIndex);
-    } else if (shuffleOn && direction < 0 && shuffleHistory.length) {
-      newIdx = shuffleHistory.pop();
-    } else {
-      let idx = currentSourceIndex === -1 ? (direction > 0 ? -1 : 0) : currentSourceIndex;
-      newIdx = idx + direction;
-      if (newIdx < 0 || newIdx >= library.length) {
-        if (!manual && repeatMode === "off") { isPlaying = false; notify(); return; }
-        newIdx = ((newIdx % library.length) + library.length) % library.length;
-      }
-    }
-    playVideoId(library[newIdx].videoId, { manual, queuePointerValue: -1 });
-  }
-
-  function playFromPlaylist(videoId) {
-    playVideoId(videoId, { manual: true, queuePointerValue: -1 });
-  }
-
-  function addToQueue(videoId) {
-    queue.push({ videoId });
-    notify();
-  }
-
-  function playQueueFromStart() {
-    if (!queue.length) return;
-    playVideoId(queue[0].videoId, { manual: true, queuePointerValue: 0 });
-  }
-
-  function playQueueIndex(idx) {
-    if (idx < 0 || idx >= queue.length) return;
-    playVideoId(queue[idx].videoId, { manual: true, queuePointerValue: idx });
-  }
-
-  function clearQueue() {
-    queue = [];
-    queuePointer = -1;
-    notify();
-  }
-
-  function reorderQueue(fromIdx, toIdx) {
-    if (fromIdx === toIdx || fromIdx < 0 || toIdx < 0 || fromIdx >= queue.length || toIdx >= queue.length) return;
-    const [moved] = queue.splice(fromIdx, 1);
-    queue.splice(toIdx, 0, moved);
-    if (queuePointer === fromIdx) queuePointer = toIdx;
-    else if (fromIdx < queuePointer && toIdx >= queuePointer) queuePointer -= 1;
-    else if (fromIdx > queuePointer && toIdx <= queuePointer) queuePointer += 1;
-    notify();
-  }
-
-  function togglePlayPause() {
-    if (!currentVideoId || !yt) return;
-    if (isPlaying) { yt.pauseVideo(); isPlaying = false; }
-    else { yt.playVideo(); isPlaying = true; }
-    notify();
-  }
-
-  function toggleShuffle() { shuffleOn = !shuffleOn; shuffleHistory = []; notify(); }
-  function cycleRepeat() {
-    repeatMode = repeatMode === "off" ? "all" : repeatMode === "all" ? "one" : "off";
-    notify();
-  }
-
-  // Full stop — distinct from pause. Clears the "now playing" state entirely,
-  // which is what puts the mini bar back into its idle look.
-  function stop() {
-    if (yt) { try { yt.stopVideo(); } catch (e) {} }
-    stopProgressTimer();
-    isPlaying = false;
-    currentVideoId = null;
-    currentSourceIndex = -1;
-    queuePointer = -1;
-    // queue contents, shuffle, and repeat mode are left alone on purpose —
-    // stop clears what's playing, not the user's queue setup.
-    notify();
-  }
-
-  // ---- sfx ---------------------------------------------------------------
-
-  function playTapeSfx() {
+  if (manual) {
     try {
-      if (!tapeAudio) tapeAudio = new Audio(SFX_TAPE);
-      tapeAudio.currentTime = 0;
-      const p = tapeAudio.play();
-      if (p && p.catch) p.catch(() => {}); // missing file / blocked autoplay — fail silently
-    } catch (e) {}
+      pEls.sfxTape.currentTime = 0;
+      await pEls.sfxTape.play();
+    } catch {
+      // autoplay-blocked or missing file — fall through and just play the track
+    }
+    setTimeout(() => {
+      playerState.player.loadVideoById(videoId);
+      playerState.player.playVideo();
+    }, TAPE_INSERT_DELAY_MS);
+  } else {
+    playerState.player.loadVideoById(videoId);
+    playerState.player.playVideo();
+  }
+}
+
+function togglePlay() {
+  if (!playerState.player) return;
+  const state = playerState.player.getPlayerState();
+  state === YT.PlayerState.PLAYING ? playerState.player.pauseVideo() : playerState.player.playVideo();
+}
+
+function randomIndexExcluding(exclude, length) {
+  if (length <= 1) return 0;
+  let idx;
+  do { idx = Math.floor(Math.random() * length); } while (idx === exclude);
+  return idx;
+}
+
+function goNext(fromAutoAdvance = false) {
+  if (playerState.repeatMode === "one" && fromAutoAdvance) {
+    return playVideoId(playerState.currentVideoId);
   }
 
-  // ---- progress ------------------------------------------------------------
-
-  function startProgressTimer() {
-    stopProgressTimer();
-    progressTimerId = window.setInterval(tickProgress, 500);
-  }
-  function stopProgressTimer() {
-    if (progressTimerId) { window.clearInterval(progressTimerId); progressTimerId = null; }
-  }
-  function tickProgress() {
-    if (!yt || typeof yt.getDuration !== "function") return;
-    const dur = yt.getDuration();
-    const cur = yt.getCurrentTime();
-    const ratio = dur > 0 ? cur / dur : 0;
-    progressListeners.forEach((fn) => fn(ratio));
+  if (playerState.queue.length > 0) {
+    const nextPointer = playerState.queuePointer + 1;
+    if (nextPointer < playerState.queue.length) {
+      playerState.queuePointer = nextPointer;
+      renderQueue();
+      return playVideoId(playerState.queue[nextPointer]);
+    }
   }
 
-  // ---- subscriptions ---------------------------------------------------
-
-  function getSnapshot() {
-    return {
-      stationId: station ? station.id : null,
-      library: library.slice(),
-      queue: queue.slice(),
-      queuePointer,
-      currentVideoId,
-      isPlaying,
-      isIdle: currentVideoId === null,
-      shuffleOn,
-      repeatMode,
-    };
+  const atEnd = playerState.playlistIndex === playerState.playlistIds.length - 1;
+  if (atEnd && playerState.repeatMode === "off" && fromAutoAdvance) {
+    playerState.player.pauseVideo();
+    return;
   }
-  function notify() { const snap = getSnapshot(); listeners.forEach((fn) => fn(snap)); }
-  function subscribe(fn) { listeners.push(fn); fn(getSnapshot()); }
-  function onProgress(fn) { progressListeners.push(fn); }
 
-  return {
-    initForStation,
-    subscribe,
-    onProgress,
-    togglePlayPause,
-    next: () => step(1, true),
-    prev: () => step(-1, true),
-    toggleShuffle,
-    cycleRepeat,
-    addToQueue,
-    playFromPlaylist,
-    playQueueFromStart,
-    playQueueIndex,
-    clearQueue,
-    reorderQueue,
-    stop,
-  };
-})();
+  playerState.queuePointer = -1;
+  playerState.playlistIndex = playerState.shuffle
+    ? randomIndexExcluding(playerState.playlistIndex, playerState.playlistIds.length)
+    : (playerState.playlistIndex + 1) % playerState.playlistIds.length;
+
+  renderQueue();
+  playVideoId(playerState.playlistIds[playerState.playlistIndex]);
+}
+
+function goPrev() {
+  if (playerState.queue.length > 0 && playerState.queuePointer > 0) {
+    playerState.queuePointer -= 1;
+    renderQueue();
+    return playVideoId(playerState.queue[playerState.queuePointer]);
+  }
+
+  playerState.queuePointer = -1;
+  playerState.playlistIndex = playerState.shuffle
+    ? randomIndexExcluding(playerState.playlistIndex, playerState.playlistIds.length)
+    : (playerState.playlistIndex - 1 + playerState.playlistIds.length) % playerState.playlistIds.length;
+
+  renderQueue();
+  playVideoId(playerState.playlistIds[playerState.playlistIndex]);
+}
+
+function handleTrackEnded() {
+  goNext(true);
+}
+
+function toggleShuffle() {
+  playerState.shuffle = !playerState.shuffle;
+  pEls.btnShuffle.classList.toggle("is-active", playerState.shuffle);
+}
+
+function cycleRepeat() {
+  const order = ["off", "all", "one"];
+  playerState.repeatMode = order[(order.indexOf(playerState.repeatMode) + 1) % order.length];
+  pEls.btnRepeat.innerHTML = playerState.repeatMode === "one" ? ICON_REPEAT_ONE : ICON_REPEAT;
+  pEls.btnRepeat.classList.toggle("is-active", playerState.repeatMode !== "off");
+  pEls.btnRepeat.title = `Repeat: ${playerState.repeatMode}`;
+}
+
+// ---------- now playing card ----------
+
+function updateNowPlayingCard() {
+  const meta = playerState.library[playerState.currentVideoId];
+  if (!meta) return;
+  pEls.playerTitle.textContent = meta.title;
+  pEls.playerArtist.textContent = meta.artist;
+  renderPlaylist();
+  renderQueue();
+}
+
+// ---------- playlist ----------
+
+function renderPlaylist() {
+  if (!pEls.trackCount) return;
+  pEls.trackCount.textContent = `${playerState.playlistIds.length} tracks`;
+
+  pEls.playlist.innerHTML = playerState.playlistIds.map((videoId, i) => {
+    const meta = playerState.library[videoId] || {};
+    return `
+      <div class="track-item ${videoId === playerState.currentVideoId ? "is-active" : ""}" data-video-id="${videoId}">
+        <span class="track-number">${String(i + 1).padStart(2, "0")}</span>
+        <div class="track-cover" style="${coverStyle(videoId, i)}"></div>
+        <div>
+          <p class="track-title">${meta.title || "Loading…"}</p>
+          <p class="track-artist">${meta.artist || ""}</p>
+        </div>
+        <span class="track-duration"></span>
+        <button class="track-add" data-add="${videoId}" aria-label="Add to queue">+</button>
+      </div>
+    `;
+  }).join("");
+}
+
+// ---------- queue ----------
+
+function renderQueue() {
+  if (!pEls.queueCount) return;
+  pEls.queueCount.textContent = playerState.queue.length;
+
+  if (playerState.queue.length === 0) {
+    pEls.queueBody.innerHTML = `
+      <div class="queue-empty">
+        <p>Queue's empty. Add a track.</p>
+        <span>LATE NIGHTS · LOUD MUSIC · EMPTY HEARTS</span>
+      </div>
+    `;
+    return;
+  }
+
+  const rows = playerState.queue.map((videoId, i) => {
+    const meta = playerState.library[videoId] || {};
+    const isCurrent = i === playerState.queuePointer && videoId === playerState.currentVideoId;
+    return `
+      <div class="track-item ${isCurrent ? "is-active" : ""}" draggable="true" data-queue-index="${i}">
+        <span class="track-number">⠿</span>
+        <div class="track-cover" style="${coverStyle(videoId, i)}"></div>
+        <div>
+          <p class="track-title">${meta.title || "Loading…"}</p>
+          <p class="track-artist">${meta.artist || ""}</p>
+        </div>
+        <span class="track-duration"></span>
+        <button class="track-add" data-remove="${i}" aria-label="Remove from queue">×</button>
+      </div>
+    `;
+  }).join("");
+
+  pEls.queueBody.innerHTML = `
+    <div class="queue-list" id="queue-list">${rows}</div>
+    <div class="queue-actions">
+      <button class="queue-play" id="btn-play-queue">▶ PLAY QUEUE</button>
+      <button class="queue-clear" id="btn-clear-queue">🗑 CLEAR</button>
+    </div>
+  `;
+}
+
+async function addToQueue(videoId) {
+  await fetchMeta(videoId);
+  playerState.queue.push(videoId);
+  renderQueue();
+}
+
+function removeFromQueue(index) {
+  playerState.queue.splice(index, 1);
+  if (playerState.queuePointer === index) playerState.queuePointer = -1;
+  else if (playerState.queuePointer > index) playerState.queuePointer -= 1;
+  renderQueue();
+}
+
+function clearQueue() {
+  playerState.queue = [];
+  playerState.queuePointer = -1;
+  renderQueue();
+}
+
+function playQueue() {
+  if (playerState.queue.length === 0) return;
+  playerState.queuePointer = 0;
+  renderQueue();
+  playVideoId(playerState.queue[0], { manual: true });
+}
+
+function reorderQueue(fromIndex, toIndex) {
+  const [moved] = playerState.queue.splice(fromIndex, 1);
+  playerState.queue.splice(toIndex, 0, moved);
+
+  if (playerState.queuePointer === fromIndex) playerState.queuePointer = toIndex;
+  else if (fromIndex < playerState.queuePointer && toIndex >= playerState.queuePointer) playerState.queuePointer -= 1;
+  else if (fromIndex > playerState.queuePointer && toIndex <= playerState.queuePointer) playerState.queuePointer += 1;
+
+  renderQueue();
+}
+
+// ---------- events (bound once — the elements they're delegated on are
+// persistent/reused across every station, so no rebinding needed) ----------
+
+pEls.btnPlay.addEventListener("click", togglePlay);
+pEls.btnNext.addEventListener("click", () => goNext(false));
+pEls.btnPrev.addEventListener("click", goPrev);
+pEls.btnShuffle.addEventListener("click", toggleShuffle);
+pEls.btnRepeat.addEventListener("click", cycleRepeat);
+
+pEls.playlist.addEventListener("click", (e) => {
+  const addBtn = e.target.closest("[data-add]");
+  if (addBtn) return addToQueue(addBtn.dataset.add);
+
+  const row = e.target.closest(".track-item");
+  if (row) {
+    playerState.queuePointer = -1;
+    playerState.playlistIndex = playerState.playlistIds.indexOf(row.dataset.videoId);
+    playVideoId(row.dataset.videoId, { manual: true });
+  }
+});
+
+pEls.queueBody.addEventListener("click", (e) => {
+  if (e.target.id === "btn-play-queue") return playQueue();
+  if (e.target.id === "btn-clear-queue") return clearQueue();
+
+  const removeBtn = e.target.closest("[data-remove]");
+  if (removeBtn) return removeFromQueue(Number(removeBtn.dataset.remove));
+
+  const row = e.target.closest("[data-queue-index]");
+  if (row) {
+    const index = Number(row.dataset.queueIndex);
+    playerState.queuePointer = index;
+    renderQueue();
+    playVideoId(playerState.queue[index], { manual: true });
+  }
+});
+
+pEls.queueBody.addEventListener("dragstart", (e) => {
+  const row = e.target.closest("[data-queue-index]");
+  if (row) playerState.draggedIndex = Number(row.dataset.queueIndex);
+});
+
+pEls.queueBody.addEventListener("dragover", (e) => {
+  if (e.target.closest("[data-queue-index]")) e.preventDefault();
+});
+
+pEls.queueBody.addEventListener("drop", (e) => {
+  const row = e.target.closest("[data-queue-index]");
+  if (!row || playerState.draggedIndex === null) return;
+  e.preventDefault();
+  const targetIndex = Number(row.dataset.queueIndex);
+  if (targetIndex !== playerState.draggedIndex) reorderQueue(playerState.draggedIndex, targetIndex);
+  playerState.draggedIndex = null;
+});
+
+renderQueue();
