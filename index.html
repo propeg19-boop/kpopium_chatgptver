@@ -42,21 +42,12 @@
         <p class="hero-tagline" id="station-tagline"></p>
       </div>
 
+      <div class="ambience-panel" id="ambience-panel" hidden></div>
+
       <div class="scroll-indicator">
         <span>SCROLL</span>
         <span class="scroll-arrow">↓</span>
       </div>
-    </section>
-
-    <section class="playlist-section">
-      <div class="section-heading">
-        <div>
-          <p class="section-eyebrow">PLAYLIST</p>
-          <h2>Tracklist</h2>
-        </div>
-        <span class="track-count" id="track-count">0 tracks</span>
-      </div>
-      <div class="playlist-list" id="playlist-list"></div>
     </section>
 
     <section class="queue-section">
@@ -68,6 +59,17 @@
         <span class="queue-count" id="queue-count">0</span>
       </div>
       <div id="queue-body"></div>
+    </section>
+
+    <section class="playlist-section">
+      <div class="section-heading">
+        <div>
+          <p class="section-eyebrow">PLAYLIST</p>
+          <h2>Tracklist</h2>
+        </div>
+        <span class="track-count" id="track-count">0 tracks</span>
+      </div>
+      <div class="playlist-list" id="playlist-list"></div>
     </section>
 
     <footer class="site-footer">
@@ -121,6 +123,7 @@
   <audio id="sfx-tape" src="assets/sfx/tape-insert.mp3" preload="auto"></audio>
 
   <script src="stations.js"></script>
+  <script src="ambience.js"></script>
   <script src="player.js"></script>
   <script src="app.js"></script>
   <script src="https://www.youtube.com/iframe_api"></script>
