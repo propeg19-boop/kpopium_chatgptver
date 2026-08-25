@@ -308,8 +308,8 @@ body {
   margin: 0 auto;
 }
 
-.playlist-section { padding: 110px 0 100px; }
-.queue-section { padding-bottom: 140px; }
+.queue-section { padding: 110px 0 40px; }
+.playlist-section { padding: 40px 0 120px; }
 
 .section-heading {
   display: flex;
