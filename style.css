@@ -832,11 +832,15 @@ body.is-shaking { animation: bass-shake 260ms linear; }
    ============================================================ */
 
 .ambience-panel {
-  position: relative;
-  z-index: 2;
+  position: fixed;
+  z-index: 12;
+  top: 70px;
+  right: 30px;
+
   display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   gap: 10px;
-  margin-top: 18px;
 }
 
 .ambience-control {
@@ -893,5 +897,6 @@ body.is-shaking { animation: bass-shake 260ms linear; }
 }
 
 @media (max-width: 700px) {
-  .ambience-panel { flex-wrap: wrap; }
+  .ambience-panel { top: 62px; right: 16px; gap: 8px; }
+  .ambience-control.is-active .ambience-volume { width: 46px; }
 }
