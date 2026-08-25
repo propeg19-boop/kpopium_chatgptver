@@ -39,6 +39,7 @@ function applyStationTheme(station) {
 function mountStation(station, { pushState = true } = {}) {
   applyStationTheme(station);
   initForStation(station); // player.js — no-ops if this station is already loaded
+  initAmbiencesForStation(station); // ambience.js — resets ambience loops for the new station
 
   appEls.viewHome.hidden = true;
   appEls.viewStation.hidden = false;
@@ -60,6 +61,7 @@ function mountHome({ pushState = true } = {}) {
   appEls.viewStation.hidden = true;
   appEls.viewHome.hidden = false;
   document.title = "GHOST SIGNAL";
+  stopAllAmbiences(); // ambience.js — atmosphere is station-specific, doesn't follow you home
 
   if (hasEverLoadedAStation) {
     appEls.player.classList.add("is-mini");
